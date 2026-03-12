@@ -28,6 +28,23 @@ import {
   setAllowedDirectories,
 } from './lib.js';
 
+const DEFAULT_MAX_TEXT_FILE_BYTES = 1024 * 1024; // 1 MiB
+const DEFAULT_MAX_MEDIA_FILE_BYTES = 10 * 1024 * 1024; // 10 MiB
+const DEFAULT_MAX_MULTI_FILE_COUNT = 50;
+const DEFAULT_MAX_MULTI_FILE_TOTAL_BYTES = 5 * 1024 * 1024; // 5 MiB
+
+function getPositiveIntEnvVar(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const MAX_TEXT_FILE_BYTES = getPositiveIntEnvVar("MCP_FS_MAX_TEXT_FILE_BYTES", DEFAULT_MAX_TEXT_FILE_BYTES);
+const MAX_MEDIA_FILE_BYTES = getPositiveIntEnvVar("MCP_FS_MAX_MEDIA_FILE_BYTES", DEFAULT_MAX_MEDIA_FILE_BYTES);
+const MAX_MULTI_FILE_COUNT = getPositiveIntEnvVar("MCP_FS_MAX_MULTI_FILE_COUNT", DEFAULT_MAX_MULTI_FILE_COUNT);
+const MAX_MULTI_FILE_TOTAL_BYTES = getPositiveIntEnvVar("MCP_FS_MAX_MULTI_FILE_TOTAL_BYTES", DEFAULT_MAX_MULTI_FILE_TOTAL_BYTES);
+
 // Command line argument parsing
 const args = process.argv.slice(2);
 if (args.length === 0) {
@@ -107,6 +124,7 @@ const ReadMultipleFilesArgsSchema = z.object({
   paths: z
     .array(z.string())
     .min(1, "At least one file path must be provided")
+    .max(MAX_MULTI_FILE_COUNT, `Maximum ${MAX_MULTI_FILE_COUNT} file paths are allowed per call`)
     .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories."),
 });
 
@@ -185,6 +203,17 @@ async function readFileAsBase64Stream(filePath: string): Promise<string> {
   });
 }
 
+async function ensureRegularFileWithinSizeLimit(filePath: string, maxBytes: number, label: string): Promise<number> {
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    throw new Error(`${label} expects a regular file: ${filePath}`);
+  }
+  if (stats.size > maxBytes) {
+    throw new Error(`${label} exceeds maximum allowed size of ${formatSize(maxBytes)}: ${filePath}`);
+  }
+  return stats.size;
+}
+
 // Tool registrations
 
 // read_file (deprecated) and read_text_file
@@ -201,6 +230,7 @@ const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>)
   } else if (args.head) {
     content = await headFile(validPath, args.head);
   } else {
+    await ensureRegularFileWithinSizeLimit(validPath, MAX_TEXT_FILE_BYTES, "read_text_file");
     content = await readFileContent(validPath);
   }
 
@@ -266,6 +296,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof ReadMediaFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
+    await ensureRegularFileWithinSizeLimit(validPath, MAX_MEDIA_FILE_BYTES, "read_media_file");
     const extension = path.extname(validPath).toLowerCase();
     const mimeTypes: Record<string, string> = {
       ".png": "image/png",
@@ -310,24 +341,30 @@ server.registerTool(
     inputSchema: {
       paths: z.array(z.string())
         .min(1)
+        .max(MAX_MULTI_FILE_COUNT)
         .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories.")
     },
     outputSchema: { content: z.string() },
     annotations: { readOnlyHint: true }
   },
   async (args: z.infer<typeof ReadMultipleFilesArgsSchema>) => {
-    const results = await Promise.all(
-      args.paths.map(async (filePath: string) => {
-        try {
-          const validPath = await validatePath(filePath);
-          const content = await readFileContent(validPath);
-          return `${filePath}:\n${content}\n`;
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          return `${filePath}: Error - ${errorMessage}`;
+    let totalBytes = 0;
+    const results: string[] = [];
+    for (const filePath of args.paths) {
+      try {
+        const validPath = await validatePath(filePath);
+        const fileSize = await ensureRegularFileWithinSizeLimit(validPath, MAX_TEXT_FILE_BYTES, "read_multiple_files");
+        if (totalBytes + fileSize > MAX_MULTI_FILE_TOTAL_BYTES) {
+          throw new Error(`read_multiple_files exceeds total size limit of ${formatSize(MAX_MULTI_FILE_TOTAL_BYTES)}`);
         }
-      }),
-    );
+        totalBytes += fileSize;
+        const content = await readFileContent(validPath);
+        results.push(`${filePath}:\n${content}\n`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        results.push(`${filePath}: Error - ${errorMessage}`);
+      }
+    }
     const text = results.join("\n---\n");
     return {
       content: [{ type: "text" as const, text }],
@@ -613,6 +650,14 @@ server.registerTool(
   async (args: z.infer<typeof MoveFileArgsSchema>) => {
     const validSourcePath = await validatePath(args.source);
     const validDestPath = await validatePath(args.destination);
+    try {
+      await fs.lstat(validDestPath);
+      throw new Error(`Destination already exists: ${args.destination}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    }
     await fs.rename(validSourcePath, validDestPath);
     const text = `Successfully moved ${args.source} to ${args.destination}`;
     const contentBlock = { type: "text" as const, text };
@@ -705,12 +750,12 @@ server.registerTool(
 // Updates allowed directories based on MCP client roots
 async function updateAllowedDirectoriesFromRoots(requestedRoots: Root[]) {
   const validatedRootDirs = await getValidRootDirectories(requestedRoots);
+  allowedDirectories = [...validatedRootDirs];
+  setAllowedDirectories(allowedDirectories); // Update the global state in lib.ts
   if (validatedRootDirs.length > 0) {
-    allowedDirectories = [...validatedRootDirs];
-    setAllowedDirectories(allowedDirectories); // Update the global state in lib.ts
     console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
   } else {
-    console.error("No valid root directories provided by client");
+    console.error("No valid root directories provided by client, access has been revoked until valid roots are provided");
   }
 }
 
@@ -721,6 +766,9 @@ server.server.setNotificationHandler(RootsListChangedNotificationSchema, async (
     const response = await server.server.listRoots();
     if (response && 'roots' in response) {
       await updateAllowedDirectoriesFromRoots(response.roots);
+    } else {
+      await updateAllowedDirectoriesFromRoots([]);
+      console.error("Client returned no roots during roots/list_changed; cleared allowed directories");
     }
   } catch (error) {
     console.error("Failed to request roots from client:", error instanceof Error ? error.message : String(error));
@@ -737,7 +785,8 @@ server.server.oninitialized = async () => {
       if (response && 'roots' in response) {
         await updateAllowedDirectoriesFromRoots(response.roots);
       } else {
-        console.error("Client returned no roots set, keeping current settings");
+        await updateAllowedDirectoriesFromRoots([]);
+        console.error("Client returned no roots; cleared allowed directories");
       }
     } catch (error) {
       console.error("Failed to request initial roots from client:", error instanceof Error ? error.message : String(error));

@@ -121,6 +121,22 @@ describe('structuredContent schema compliance', () => {
       // The content should contain success message
       expect(structuredContent.content).toContain('Successfully moved');
     });
+
+    it('should fail when destination already exists', async () => {
+      const sourcePath = path.join(testDir, 'test.txt');
+      const destPath = path.join(testDir, 'existing.txt');
+      await fs.writeFile(destPath, 'already here');
+
+      await expect(
+        client.callTool({
+          name: 'move_file',
+          arguments: {
+            source: sourcePath,
+            destination: destPath
+          }
+        })
+      ).rejects.toThrow(/Destination already exists/);
+    });
   });
 
   describe('list_directory (control - already working)', () => {
@@ -153,6 +169,21 @@ describe('structuredContent schema compliance', () => {
       const structuredContent = result.structuredContent as { content: unknown };
       expect(typeof structuredContent.content).toBe('string');
       expect(Array.isArray(structuredContent.content)).toBe(false);
+    });
+  });
+
+  describe('read limits', () => {
+    it('should reject oversized full-file reads in read_text_file', async () => {
+      const bigFile = path.join(testDir, 'big.txt');
+      const oneMiBPlus = 'a'.repeat(1024 * 1024 + 1);
+      await fs.writeFile(bigFile, oneMiBPlus);
+
+      await expect(
+        client.callTool({
+          name: 'read_text_file',
+          arguments: { path: bigFile }
+        })
+      ).rejects.toThrow(/exceeds maximum allowed size/);
     });
   });
 });

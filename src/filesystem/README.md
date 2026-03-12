@@ -5,7 +5,7 @@ Node.js server implementing Model Context Protocol (MCP) for filesystem operatio
 ## Features
 
 - Read/write files
-- Create/list/delete directories
+- Create/list directories
 - Move files/directories
 - Search files
 - Get file metadata
@@ -24,7 +24,7 @@ mcp-server-filesystem /path/to/dir1 /path/to/dir2
 ### Method 2: MCP Roots (Recommended)
 MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories. 
 
-Roots notified by Client to Server, completely replace any server-side Allowed directories when provided.
+Roots notified by Client to Server completely replace any server-side Allowed directories. If the client sends empty or invalid roots, the allowlist is cleared.
 
 **Important**: If server starts without command-line arguments AND client doesn't support roots protocol (or provides empty roots), the server will throw an error during initialization.
 
@@ -56,7 +56,7 @@ The server's directory access control follows this flow:
 5. **Access Control**
    - All filesystem operations are restricted to allowed directories
    - Use `list_allowed_directories` tool to see current directories
-   - Server requires at least ONE allowed directory to operate
+   - If allowed directories are empty, all path-based operations are denied until valid directories are provided
 
 **Note**: The server will only allow operations within directories specified either via `args` or via Roots.
 
@@ -74,17 +74,20 @@ The server's directory access control follows this flow:
     - `tail` (number, optional): Last N lines
   - Always treats the file as UTF-8 text regardless of extension
   - Cannot specify both `head` and `tail` simultaneously
+  - Enforces size limit for full-file reads (`MCP_FS_MAX_TEXT_FILE_BYTES`, default 1 MiB)
 
 - **read_media_file**
   - Read an image or audio file
   - Inputs:
     - `path` (string)
   - Streams the file and returns base64 data with the corresponding MIME type
+  - Enforces size limit (`MCP_FS_MAX_MEDIA_FILE_BYTES`, default 10 MiB)
 
 - **read_multiple_files**
   - Read multiple files simultaneously
   - Input: `paths` (string[])
   - Failed reads won't stop the entire operation
+  - Enforces per-file and total size limits (`MCP_FS_MAX_TEXT_FILE_BYTES`, `MCP_FS_MAX_MULTI_FILE_TOTAL_BYTES`) and max file count (`MCP_FS_MAX_MULTI_FILE_COUNT`, default 50)
 
 - **write_file**
   - Create new file or overwrite existing (exercise caution with this)
@@ -174,6 +177,25 @@ The server's directory access control follows this flow:
   - No input required
   - Returns:
     - Directories that this server can read/write from
+
+### Operational Limits
+
+To reduce memory-pressure risk in production environments, read operations enforce configurable limits:
+
+- `MCP_FS_MAX_TEXT_FILE_BYTES`
+  - Maximum bytes for full-file reads in `read_text_file` and per-file reads in `read_multiple_files`
+  - Default: `1048576` (1 MiB)
+- `MCP_FS_MAX_MEDIA_FILE_BYTES`
+  - Maximum bytes for `read_media_file`
+  - Default: `10485760` (10 MiB)
+- `MCP_FS_MAX_MULTI_FILE_COUNT`
+  - Maximum number of paths accepted by `read_multiple_files`
+  - Default: `50`
+- `MCP_FS_MAX_MULTI_FILE_TOTAL_BYTES`
+  - Maximum combined bytes read in a single `read_multiple_files` call
+  - Default: `5242880` (5 MiB)
+
+If a limit is exceeded, the tool returns a validation error and does not read additional oversized content.
 
 ### Tool annotations (MCP hints)
 
